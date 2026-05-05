@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+**/dist/
+**/build/
+
+# Local environments and credentials
+.env
+.env.*
+!.env.example
+
+# Runtime state, logs, and local workspaces
+*.log
+*.out
+screenlog.*
+*.tmp
+*.bak
+*.bak-*
+logs/
+pr-fix-patches/
+**/logs/
+**/pr-fix-patches/
+openreview/.openreview-state.json
+openreview/.openreview-state.json.lock
+openreview/.openreview-state.runtime.json
+autocode/.autocode-state.json
+autocode/.autocode-state.json.*
+autocode/.autocode-service-state.json
+autocode/logs/
+autocode/pr-fix-patches/
+
+# Tool-local files
+.codex/
+.claude/
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
