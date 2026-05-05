@@ -21,7 +21,10 @@ _TRANSIENT_WORKSPACE_FILES = {
     "pull-request.md",
     "pull_request.md",
 }
-_ALREADY_CHECKED_OUT_PATH_RE = re.compile(r"already checked out at '([^']+)'")
+_ALREADY_CHECKED_OUT_PATH_RE = re.compile(
+    r"(?:already checked out|already used by worktree) at '([^']+)'",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)

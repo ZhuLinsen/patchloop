@@ -34,6 +34,7 @@ autocode/.autocode-state.json.*
 autocode/.autocode-service-state.json
 autocode/logs/
 autocode/pr-fix-patches/
+autocode/projects/
 
 # Tool-local files
 .codex/
