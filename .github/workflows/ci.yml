@@ -29,6 +29,11 @@ jobs:
           pip install -r requirements.txt
           pip install pytest
 
+      - name: Configure git identity
+        run: |
+          git config --global user.name "PatchLoop CI"
+          git config --global user.email "patchloop-ci@example.com"
+
       - name: Compile OpenReview
         working-directory: openreview
         run: python -m compileall -q .
