@@ -426,8 +426,8 @@ class ExecutionControllerTests(unittest.TestCase):
                 )
                 self.assertFalse(should_auto, f"{task_type} should NOT auto-execute")
 
-    def test_should_auto_execute_allows_owner_feature_types(self):
-        """Repo owner 自己创建的 feature issue 视为已授权执行。"""
+    def test_should_auto_execute_blocks_owner_feature_types_by_default(self):
+        """Repo owner 自己创建的 feature issue 默认也只生成计划。"""
         with tempfile.TemporaryDirectory() as tmpdir:
             controller = _build_controller(workspace_path=Path(tmpdir))
             controller.config.autocode.mode = "auto"
@@ -445,7 +445,61 @@ class ExecutionControllerTests(unittest.TestCase):
                     ),
                     owner_authored_issue=True,
                 )
-                self.assertTrue(should_auto, f"{task_type} should auto-execute for owner-authored issues")
+                self.assertFalse(should_auto, f"{task_type} should NOT auto-execute for owner-authored issues")
+
+    def test_execute_issue_owner_authored_feature_defaults_to_plan_only(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace_path = Path(tmpdir)
+            gh_writer = FakeGitHubWriteClient()
+            controller = _build_controller(
+                workspace_path=workspace_path,
+                gh_writer=gh_writer,
+            )
+            controller.config.autocode.mode = "auto"
+            controller.config.autocode.auto_implement_on_issue_open = True
+            planning = PlanningResult(
+                issue_number=226,
+                title="[Feature] add export",
+                body="please add export",
+                labels=["enhancement"],
+                updated_at="2026-04-01T05:22:00Z",
+                comment="plan",
+                triage=AutoCodeTriageResult(
+                    task_type="small_feature",
+                    action="implement",
+                    risk_level="low",
+                    reason="owner requested feature",
+                    confidence=0.9,
+                ),
+                plan=ExecutionPlan(
+                    goal="Add export",
+                    assumptions=[],
+                    acceptance_criteria=["export action is available"],
+                    risk_level="low",
+                    estimated_files=["app.py"],
+                    suggested_tests=[],
+                    needs_human_approval=False,
+                    blocked_reasons=[],
+                ),
+                issue_key="issue:226:test",
+            )
+
+            result = controller.execute_issue(
+                {
+                    "number": 226,
+                    "title": "[Feature] add export",
+                    "body": "please add export",
+                    "labels": [{"name": "enhancement"}],
+                    "updated_at": "2026-04-01T05:22:00Z",
+                    "user": {"login": "repoowner", "type": "User"},
+                },
+                explicit_command=False,
+                planning=planning,
+            )
+
+            self.assertFalse(result.success)
+            self.assertEqual("planned", result.run_record.status)
+            self.assertEqual(0, len(gh_writer.created_payloads))
 
     def test_should_auto_execute_blocks_high_risk_feature_when_disabled(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -700,6 +754,7 @@ class ExecutionControllerTests(unittest.TestCase):
             self.assertEqual(1, len(gh_writer.updated_payloads))
             self.assertEqual(91, gh_writer.updated_payloads[0][0])
             self.assertEqual("fix: 修复工作区执行问题 (#1)", gh_writer.updated_payloads[0][1]["title"])
+            self.assertNotIn("body", gh_writer.updated_payloads[0][1])
             self.assertEqual(91, result.run_record.pr_number)
 
     def test_execute_issue_pr_body_highlights_key_metadata(self):
@@ -787,7 +842,58 @@ class ExecutionControllerTests(unittest.TestCase):
                 plan_goal="修复启动早期失败时日志缺失与根因不透明问题",
             )
 
-            self.assertEqual("fix: 修复启动早期失败时日志缺失与根因不透明问题 (#839)", pr_title)
+            self.assertEqual("fix: 启动早期失败时日志缺失与根因不透明问题 (#839)", pr_title)
+
+    def test_build_pr_title_compacts_api_status_null_title(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            controller = _build_controller(workspace_path=Path(tmpdir))
+
+            pr_title = controller._build_pr_title(
+                "bug_fix",
+                "[Bug] /api/v1/analysis/status/{task_id} 在completed时result永远都会返回null，这让openclaw很晕菜",
+                1382,
+                plan_goal="修复 completed 状态下优先读取内存任务结果时 result 因字段不完整解析失败而返回null",
+            )
+
+            self.assertEqual("fix: analysis status result 返回 null (#1382)", pr_title)
+
+    def test_build_pr_title_compacts_desktop_packaging_title(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            controller = _build_controller(workspace_path=Path(tmpdir))
+
+            pr_title = controller._build_pr_title(
+                "bug_fix",
+                "[Bug] macOS 桌面端 v3.17.1 打包缺失 strategies/ 目录，导致 Agent 0 skills 加载",
+                1377,
+                plan_goal="在桌面端 PyInstaller 打包链路中把 strategies/*.yaml 作为数据文件随包分发",
+            )
+
+            self.assertEqual("fix: macOS 桌面端打包缺失 strategies 目录 (#1377)", pr_title)
+
+    def test_build_pr_title_uses_goal_for_vague_suggestion_title(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            controller = _build_controller(workspace_path=Path(tmpdir))
+
+            pr_title = controller._build_pr_title(
+                "small_feature",
+                "[Feature] 建议个股分析界面略作调整",
+                1384,
+                plan_goal="调整个股分析详情页中“关联板块”的展示位置与 tag 布局，使其位于操作建议下方",
+            )
+
+            self.assertEqual("feat: 个股分析页关联板块布局 (#1384)", pr_title)
+
+    def test_should_not_keep_existing_pr_title_without_issue_space(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            controller = _build_controller(workspace_path=Path(tmpdir))
+
+            keep = controller._should_keep_existing_pr_title(
+                "fix: 修复 completed 状态下优先读取内存任务结果时 result 因字段不完整解析失败而返回null(#1382)",
+                "bug_fix",
+                1382,
+            )
+
+            self.assertFalse(keep)
 
     def test_build_pr_title_uses_plan_goal_for_bare_prefix_title(self):
         """Issue titles like '[Bug]' or '[Feature]' should fall back to plan.goal."""
@@ -801,7 +907,8 @@ class ExecutionControllerTests(unittest.TestCase):
                 plan_goal="修复 WebUI 修改 SCHEDULE_TIME 后运行中的调度器不生效",
             )
             self.assertNotIn("[Bug]", pr_title.split("(#")[0])
-            self.assertIn("修复 WebUI", pr_title)
+            self.assertIn("WebUI", pr_title)
+            self.assertNotIn("fix: 修复", pr_title)
 
             pr_title2 = controller._build_pr_title(
                 "small_feature",
@@ -1048,10 +1155,10 @@ class ExecutionControllerTests(unittest.TestCase):
             workspace_path = Path(tmpdir)
             project_dir = workspace_path / "projects"
             project_dir.mkdir(parents=True, exist_ok=True)
-            project_log = project_dir / "example_repo.md"
+            project_log = project_dir / "daily_stock_analysis.md"
             project_log.write_text(
                 (
-                    "# example_repo Execution Log\n\n"
+                    "# daily_stock_analysis Execution Log\n\n"
                     "## 已处理记录\n\n"
                     "| 日期 | 类型 | 编号 | 主题 | 动作 | 结果 | 备注 |\n"
                     "| --- | --- | --- | --- | --- | --- | --- |\n"
@@ -1060,7 +1167,7 @@ class ExecutionControllerTests(unittest.TestCase):
                 encoding="utf-8",
             )
             controller = _build_controller(workspace_path=workspace_path)
-            controller.config.github.repo = "demo/example_repo"
+            controller.config.github.repo = "demo/daily_stock_analysis"
             controller.config.autocode.project_log_root = str(project_dir)
             controller.policy_engine = SimpleNamespace(
                 evaluate_issue=lambda **kwargs: PolicyDecision(
@@ -1130,7 +1237,7 @@ class ExecutionControllerTests(unittest.TestCase):
             (workspace_path / "app.py").write_text("print('hello')\n", encoding="utf-8")
             project_dir = workspace_path / "projects"
             controller = _build_controller(workspace_path=workspace_path)
-            controller.config.github.repo = "demo/example_repo"
+            controller.config.github.repo = "demo/daily_stock_analysis"
             controller.config.autocode.project_log_root = str(project_dir)
 
             summary = controller._apply_review_feedback(
@@ -1139,11 +1246,71 @@ class ExecutionControllerTests(unittest.TestCase):
             )
 
             self.assertIn("已根据 review 反馈更新分支", summary)
-            project_log = project_dir / "example_repo.md"
+            project_log = project_dir / "daily_stock_analysis.md"
             log_text = project_log.read_text(encoding="utf-8")
             self.assertIn("| PR | 11 | PR #11 | review_feedback | updated |", log_text)
 
-    def test_apply_review_feedback_refreshes_pr_body_from_issue_plan_snapshot(self):
+    def test_apply_review_feedback_uses_specific_commit_subject(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace_path = Path(tmpdir)
+            (workspace_path / "app.py").write_text("print('hello')\n", encoding="utf-8")
+            controller = _build_controller(workspace_path=workspace_path)
+
+            summary = controller._apply_review_feedback(
+                _build_pr(1284),
+                [
+                    {
+                        "id": 3235193075,
+                        "path": "src/analyzer.py",
+                        "body": (
+                            "Consider reading usage with the same dict/object abstraction "
+                            "(e.g., `_get_response_field(response, \"usage\")`) to preserve "
+                            "token accounting consistently."
+                        ),
+                        "user": {"login": "copilot-pull-request-reviewer[bot]"},
+                    },
+                ],
+            )
+
+            self.assertIn("已根据 review 反馈更新分支", summary)
+            self.assertEqual(1, len(controller.workspace_manager.commit_calls))
+            subject = controller.workspace_manager.commit_calls[0]
+            self.assertTrue(subject.startswith("fix(review-feedback-1284): "))
+            self.assertIn("usage", subject)
+            self.assertIn("dict/object abstraction", subject)
+            self.assertNotIn("address latest review comments", subject)
+
+    def test_review_feedback_commit_subject_strips_review_badges(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace_path = Path(tmpdir)
+            controller = _build_controller(workspace_path=workspace_path)
+
+            subject = controller._review_feedback_commit_message(
+                1289,
+                [
+                    {
+                        "path": "src/analyzer.py",
+                        "body": (
+                            "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)"
+                            "</sub></sub> Detect buy advice before skipping unavailable flow**\n\n"
+                            "When `decision_type` is `hold` while `operation_advice` still says buy, "
+                            "the guard skips the downgrade.\n\n"
+                            "Useful? React with thumbs up / thumbs down."
+                        ),
+                    },
+                ],
+            )
+
+            self.assertEqual(
+                "fix(review-feedback-1289): Detect buy advice before skipping unavailable flow",
+                subject,
+            )
+            self.assertNotIn("P2", subject)
+            self.assertNotIn("Badge", subject)
+            self.assertNotIn("sub", subject)
+            self.assertNotIn("http", subject)
+
+    def test_apply_review_feedback_preserves_pr_body_after_code_repair(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace_path = Path(tmpdir)
             (workspace_path / "app.py").write_text("print('hello')\n", encoding="utf-8")
@@ -1183,7 +1350,12 @@ class ExecutionControllerTests(unittest.TestCase):
             state_store.save_issue_plan_snapshot(877, planning.to_snapshot_record())
             pr = _build_pr(11)
             pr["title"] = "fix: 修复 INFO 日志默认输出 LLM prompt/response 预览的问题 (#877)"
-            pr["body"] = "## Issue Link\n- `Fixes #877`\n"
+            pr["body"] = (
+                "## Background And Problem\n"
+                "- 人工收敛后的真实 PR 描述。\n\n"
+                "## Issue Link\n"
+                "- `Fixes #877`\n"
+            )
 
             summary = controller._apply_review_feedback(
                 pr,
@@ -1191,10 +1363,9 @@ class ExecutionControllerTests(unittest.TestCase):
             )
 
             self.assertIn("已根据 review 反馈更新分支", summary)
-            self.assertTrue(gh_writer.updated_payloads)
-            _, payload = gh_writer.updated_payloads[-1]
-            self.assertIn("## Scope Of Change", payload.get("body", ""))
-            self.assertIn("Closes #877", payload.get("body", ""))
+            self.assertEqual(1, len(controller.workspace_manager.commit_calls))
+            self.assertEqual(["autocode/issue-11-demo"], controller.workspace_manager.push_calls)
+            self.assertEqual([], gh_writer.updated_payloads)
 
     def test_apply_review_feedback_refreshes_pr_body_without_code_changes_for_metadata_only_feedback(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1661,7 +1832,9 @@ pytest tests/test_analyzer_logging.py
     def test_execute_issue_respects_owner_non_pr_guidance_even_when_explicit(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace_path = Path(tmpdir)
-            planner = SequenceAdapter([])
+            planner = SequenceAdapter([
+                json.dumps({"intent": "IGNORE", "reason": "普通确认", "confidence": 0.9}, ensure_ascii=False),
+            ])
             gh = FakeGitHubClient(
                 issue_comment_pages={
                     1: [
@@ -1700,12 +1873,14 @@ pytest tests/test_analyzer_logging.py
             self.assertFalse(result.success)
             self.assertEqual("manual_action", result.run_record.status)
             self.assertEqual(0, len(gh.posted_comments))
-            self.assertEqual(0, len(planner.prompts))
+            self.assertEqual(1, len(planner.prompts))
 
     def test_execute_issue_ignores_stale_owner_non_pr_guidance_after_newer_owner_comment(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace_path = Path(tmpdir)
             planner = SequenceAdapter([
+                json.dumps({"intent": "IGNORE", "reason": "普通确认", "confidence": 0.9}, ensure_ascii=False),
+                json.dumps({"intent": "IMPLEMENT", "reason": "明确实现", "confidence": 0.9}, ensure_ascii=False),
                 json.dumps({
                     "triage": {
                         "task_type": "bug_fix",
@@ -3230,7 +3405,7 @@ pytest tests/test_analyzer_logging.py
                         },
                         {
                             "id": 602,
-                            "user": {"login": "maintainer"},
+                            "user": {"login": "ZhuLinsen"},
                             "state": "COMMENTED",
                             "body": (
                                 "**评审结论**\n"
@@ -3284,7 +3459,7 @@ pytest tests/test_analyzer_logging.py
                     1: [
                         {
                             "id": 611,
-                            "user": {"login": "maintainer"},
+                            "user": {"login": "ZhuLinsen"},
                             "state": "COMMENTED",
                             "body": (
                                 "**评审结论**\n"
@@ -3325,7 +3500,7 @@ pytest tests/test_analyzer_logging.py
                     1: [
                         {
                             "id": 621,
-                            "user": {"login": "maintainer"},
+                            "user": {"login": "ZhuLinsen"},
                             "state": "COMMENTED",
                             "body": (
                                 "**评审结论**\n"
@@ -3343,7 +3518,7 @@ pytest tests/test_analyzer_logging.py
                     1: [
                         {
                             "id": 721,
-                            "user": {"login": "maintainer"},
+                            "user": {"login": "ZhuLinsen"},
                             "body": "Old-head inline note",
                             "path": "src/app.py",
                             "pull_request_review_id": 621,
@@ -3384,7 +3559,7 @@ pytest tests/test_analyzer_logging.py
             cached_feedback = [
                 {
                     "id": 631,
-                    "user": {"login": "maintainer"},
+                    "user": {"login": "ZhuLinsen"},
                     "state": "COMMENTED",
                     "body": (
                         "**评审结论**\n"
@@ -3398,7 +3573,7 @@ pytest tests/test_analyzer_logging.py
                 },
                 {
                     "id": 731,
-                    "user": {"login": "maintainer"},
+                    "user": {"login": "ZhuLinsen"},
                     "body": "Old-head inline note",
                     "path": "src/app.py",
                     "pull_request_review_id": 631,
@@ -3535,7 +3710,7 @@ class BotFeedbackDetectionTests(unittest.TestCase):
     def test_bot_only_feedback_openreview_marker(self):
         ctrl = self._make_controller()
         feedback = [
-            {"body": "评审结论\n<!-- openreview:idempotency:abc123 -->", "user": {"login": "maintainer"}},
+            {"body": "评审结论\n<!-- openreview:idempotency:abc123 -->", "user": {"login": "ZhuLinsen"}},
         ]
         self.assertTrue(ctrl._is_bot_only_feedback(feedback))
 
@@ -3900,7 +4075,7 @@ class BotFeedbackDetectionTests(unittest.TestCase):
                     1: [
                         {
                             "id": 801,
-                            "user": {"login": "maintainer"},
+                            "user": {"login": "ZhuLinsen"},
                             "state": "COMMENTED",
                             "body": (
                                 "**评审结论**\n"
@@ -3950,7 +4125,7 @@ class BotFeedbackDetectionTests(unittest.TestCase):
                         },
                         {
                             "id": 902,
-                            "user": {"login": "maintainer"},
+                            "user": {"login": "ZhuLinsen"},
                             "state": "COMMENTED",
                             "body": (
                                 "**评审结论**\n"
@@ -4112,7 +4287,7 @@ class BotFeedbackDetectionTests(unittest.TestCase):
     def test_rebase_skipped_when_no_conflicts(self):
         """PRs without merge conflicts (clean/blocked) should NOT be rebased
         to avoid unnecessary force-pushes that re-run CI and disrupt reviews."""
-        for state in ("clean", "blocked", "has_hooks"):
+        for state in ("clean", "blocked", "has_hooks", "unknown", ""):
             with self.subTest(mergeable_state=state):
                 with tempfile.TemporaryDirectory() as tmpdir:
                     workspace_path = Path(tmpdir)

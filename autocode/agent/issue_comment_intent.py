@@ -1,7 +1,30 @@
 """Shared helpers for identifying owner-issued implement commands on issues."""
 from __future__ import annotations
 
+import logging
 import re
+from dataclasses import dataclass
+from typing import Protocol
+
+from agent.json_utils import extract_json_object
+from prompts import build_issue_comment_intent_prompt
+
+logger = logging.getLogger(__name__)
+
+
+class _IntentAnalyzer(Protocol):
+    def analyze(self, prompt: str, system: str = "") -> str:
+        ...
+
+
+@dataclass(frozen=True)
+class IssueCommentIntentResult:
+    requests_implementation: bool
+    reason: str
+    confidence: float
+    source: str
+    degraded: bool = False
+    internal_error: str = ""
 
 _BOT_BODY_MARKERS = (
     "<!-- openreview:idempotency:issue:",
@@ -11,42 +34,55 @@ _BOT_BODY_MARKERS = (
 )
 _BOT_FOOTER_RE = re.compile(r"此回复由\s+.*?bot\s+自动生成", re.IGNORECASE)
 _IMPLEMENT_NEGATION_RE = re.compile(
-    r"(?:未实现|已实现|难实现|不好实现|实现不了|无法实现|不能实现|不要实现|不用实现|无需实现|不必实现|"
-    r"暂不实现|暂时不实现|先别实现|别实现|不实现)",
+    r"(?:未实现|已实现|已修复|已经修复|难实现|不好实现|实现不了|修不了|无法实现|无法修复|不能实现|不能修复|"
+    r"不要实现|不要修|不用实现|不用修|无需实现|无需修复|不必实现|不必修复|"
+    r"暂不实现|暂不修|暂时不实现|暂时不修|先别实现|先别修|别实现|别修|不实现|不修复|无需\s*PR|不用\s*PR)",
     re.IGNORECASE,
 )
 _IMPLEMENT_TAIL_RE = r"(?:[，,；;。.!！]\s*.+)?"
+_IMPLEMENT_ACTION_RE = r"(?:实现|implement|落地|修复|修一下|修下|修|改一下|改下|改|处理|做一下|做下)"
 _IMPLEMENT_APPROVAL_PATTERNS = (
     re.compile(
-        rf"^(?:请|麻烦|辛苦)?(?:现在|直接|尽快|继续)?(?:开始|继续|进行|着手|安排|推进)?"
-        rf"(?:实现|implement|落地)(?:一下|下)?(?:了|吧)?{_IMPLEMENT_TAIL_RE}$",
+        rf"^(?:请|麻烦|辛苦|帮忙|帮我)?(?:现在|直接|尽快|继续|重新|再)?(?:开始|继续|进行|着手|安排|推进)?"
+        rf"{_IMPLEMENT_ACTION_RE}(?:一下|下)?(?:了|吧)?{_IMPLEMENT_TAIL_RE}$",
         re.IGNORECASE,
     ),
     re.compile(
-        rf"^(?:可以|可)(?:现在|直接|开始|继续)?(?:实现|implement|落地)(?:了|吧)?{_IMPLEMENT_TAIL_RE}$",
+        rf"^(?:可以|可)(?:现在|直接|开始|继续|进行)?{_IMPLEMENT_ACTION_RE}(?:了|吧)?{_IMPLEMENT_TAIL_RE}$",
         re.IGNORECASE,
     ),
     re.compile(
         rf"^(?:就)?按(?:这个|此|该|上面|上述|前述)?(?:方案|思路|方向|计划)?(?:来|去)?"
-        rf"(?:实现|做|改|落地)(?:吧|一下|下)?{_IMPLEMENT_TAIL_RE}$",
+        rf"(?:实现|做|改|修|修复|处理|落地)(?:吧|一下|下)?{_IMPLEMENT_TAIL_RE}$",
         re.IGNORECASE,
     ),
     re.compile(
         rf"^(?:按|照)(?:这个|此|该|上面|上述|前述)?(?:方案|思路|方向|计划)?(?:来|去)?"
-        rf"(?:实现|做|改|落地)(?:吧|一下|下)?{_IMPLEMENT_TAIL_RE}$",
+        rf"(?:实现|做|改|修|修复|处理|落地)(?:吧|一下|下)?{_IMPLEMENT_TAIL_RE}$",
         re.IGNORECASE,
     ),
     re.compile(
         rf"^(?:可以|可)(?:按|照)(?:这个|此|该|上面|上述|前述)?(?:方案|思路|方向|计划)?(?:来|去)?"
-        rf"(?:实现|做|改|落地)(?:了|吧)?{_IMPLEMENT_TAIL_RE}$",
+        rf"(?:实现|做|改|修|修复|处理|落地)(?:了|吧)?{_IMPLEMENT_TAIL_RE}$",
         re.IGNORECASE,
     ),
 )
 _DIRECT_IMPLEMENT_PATTERNS = (
-    re.compile(r"(?:你|bot|autocode)?\s*(?:直接|继续|重新|再|帮我|帮忙|麻烦|辛苦).{0,12}(?:修|改|做|处理|实现|落地)", re.IGNORECASE),
-    re.compile(r"(?:按|照).{0,20}(?:方案|思路|方向|计划|你说的|上面|上述|前述).{0,12}(?:做|改|修|处理|实现|落地)", re.IGNORECASE),
-    re.compile(r"(?:开|提)\s*(?:个)?\s*PR", re.IGNORECASE),
-    re.compile(r"(?:go ahead|please fix|fix it|ship it|open a pr|create a pr|send a pr)", re.IGNORECASE),
+    re.compile(
+        r"(?:你|bot|autocode)?\s*(?:请|直接|开始|进行|着手|安排|推进|继续|重新|再|帮我|帮忙|麻烦|辛苦)"
+        r".{0,16}(?:修复|修|改|做|处理|实现|落地)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:按|照).{0,20}(?:方案|思路|方向|计划|你说的|上面|上述|前述)"
+        r".{0,16}(?:做|改|修|修复|处理|实现|落地)",
+        re.IGNORECASE,
+    ),
+    re.compile(r"(?:开|提|提交|创建)\s*(?:个|一个)?\s*(?:PR|pull request)", re.IGNORECASE),
+    re.compile(
+        r"(?:go ahead|please fix|fix it|ship it|open a pr|create a pr|send a pr|submit a pr|make the change)",
+        re.IGNORECASE,
+    ),
 )
 _NOT_RESOLVED_PATTERNS = (
     re.compile(r"(?:还是|仍然|依然|依旧).{0,12}(?:不行|失败|报错|没好|没有解决)", re.IGNORECASE),
@@ -58,6 +94,7 @@ _NOT_RESOLVED_PATTERNS = (
 _MARKDOWN_NOISE_RE = re.compile(r"[`*_~]")
 _WHITESPACE_RE = re.compile(r"\s+")
 _MAX_SEMANTIC_COMMENT_LENGTH = 500
+_LLM_CONFIDENCE_THRESHOLD = 0.5
 
 
 def is_bot_generated_issue_comment(comment_or_body: dict | str) -> bool:
@@ -74,6 +111,7 @@ def normalize_issue_comment_text(body: str) -> str:
 
 
 def issue_comment_requests_implementation(body: str) -> bool:
+    """Regex-only fallback used when the LLM intent classifier is unavailable."""
     raw = str(body or "").strip()
     if not raw or is_bot_generated_issue_comment(raw):
         return False
@@ -91,6 +129,83 @@ def issue_comment_requests_implementation(body: str) -> bool:
     if any(pattern.search(text) for pattern in _NOT_RESOLVED_PATTERNS):
         return True
     return False
+
+
+def classify_issue_comment_implementation_intent(
+    body: str,
+    *,
+    analyzer: _IntentAnalyzer | None = None,
+    issue_title: str = "",
+    repo_name: str = "",
+) -> IssueCommentIntentResult:
+    """Classify whether a human owner comment asks AutoCode to implement.
+
+    The LLM is the primary semantic classifier.  Regex is only used as a
+    deterministic fallback when the model is unavailable, malformed, or too
+    uncertain.
+    """
+    raw = str(body or "").strip()
+    if not raw:
+        return IssueCommentIntentResult(False, "empty_comment", 1.0, "guard")
+    if is_bot_generated_issue_comment(raw):
+        return IssueCommentIntentResult(False, "bot_generated", 1.0, "guard")
+
+    if analyzer is not None:
+        llm_result = _classify_issue_comment_with_llm(
+            raw,
+            analyzer=analyzer,
+            issue_title=issue_title,
+            repo_name=repo_name,
+        )
+        if llm_result is not None:
+            return llm_result
+
+    matched = issue_comment_requests_implementation(raw)
+    return IssueCommentIntentResult(
+        requests_implementation=matched,
+        reason="regex_match" if matched else "regex_no_match",
+        confidence=0.65 if matched else 0.6,
+        source="regex_fallback",
+        degraded=analyzer is not None,
+    )
+
+
+def _classify_issue_comment_with_llm(
+    body: str,
+    *,
+    analyzer: _IntentAnalyzer,
+    issue_title: str = "",
+    repo_name: str = "",
+) -> IssueCommentIntentResult | None:
+    prompt = build_issue_comment_intent_prompt(
+        body=body,
+        issue_title=issue_title,
+        repo_name=repo_name,
+    )
+    try:
+        raw = analyzer.analyze(prompt, system="你是精确的 GitHub Issue 评论意图分类器，只输出 JSON。")
+        data = extract_json_object(raw, context="issue comment intent 回复")
+        intent = str(data.get("intent", "") or "").strip().upper()
+        if intent not in {"IMPLEMENT", "IGNORE"}:
+            raise ValueError(f"unknown intent: {intent or '<empty>'}")
+        confidence = float(data.get("confidence", 0.0) or 0.0)
+        confidence = max(0.0, min(confidence, 1.0))
+        if confidence < _LLM_CONFIDENCE_THRESHOLD:
+            logger.info(
+                "issue-comment-intent: low-confidence LLM result intent=%s confidence=%.2f, falling back to regex",
+                intent,
+                confidence,
+            )
+            return None
+        return IssueCommentIntentResult(
+            requests_implementation=intent == "IMPLEMENT",
+            reason=str(data.get("reason", "") or intent.lower()),
+            confidence=confidence,
+            source="llm",
+        )
+    except Exception as exc:
+        logger.warning("issue-comment-intent: LLM classification failed, falling back to regex: %s", exc)
+        return None
 
 
 def is_repo_owner_human_issue_comment(comment: dict, repo_owner: str) -> bool:

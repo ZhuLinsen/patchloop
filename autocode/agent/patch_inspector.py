@@ -111,7 +111,11 @@ class PatchInspector:
             reasons.append(f"删除行数超限: {budget_deleted_lines} > {self.max_deleted_lines}")
 
         has_test_changes = any(_looks_like_test_file(path) for path in changed_files)
-        if require_test_changes and not has_test_changes:
+        if (
+            require_test_changes
+            and not has_test_changes
+            and not _is_test_file_requirement_exempt_patch(changed_files)
+        ):
             reasons.append("bug_fix 未包含测试改动，按策略需人工确认")
 
         return PatchInspectionResult(
@@ -340,6 +344,63 @@ def _is_supporting_budget_file(rel_path: str) -> bool:
     if "/examples/" in normalized or normalized.startswith("examples/"):
         return True
     return False
+
+
+def _is_test_file_requirement_exempt_patch(changed_files: list[str]) -> bool:
+    normalized = [_normalize_rel_path(path).lower() for path in changed_files if _normalize_rel_path(path)]
+    if not normalized:
+        return False
+    return all(_is_test_file_requirement_exempt_path(path) for path in normalized)
+
+
+def _is_test_file_requirement_exempt_path(rel_path: str) -> bool:
+    normalized = _normalize_rel_path(rel_path).lower()
+    if not normalized:
+        return False
+    if _is_dependency_manifest_path(normalized):
+        return True
+    if normalized.endswith((".md", ".mdx", ".rst", ".txt")) or normalized.startswith(("docs/", "doc/")):
+        return True
+    return normalized in {".env.example", ".env.sample", ".env.template"}
+
+
+def _is_dependency_manifest_path(rel_path: str) -> bool:
+    normalized = _normalize_rel_path(rel_path).lower()
+    name = normalized.rsplit("/", 1)[-1]
+    if name in {
+        "requirements.txt",
+        "requirements-dev.txt",
+        "requirements-test.txt",
+        "requirements.lock",
+        "constraints.txt",
+        "pyproject.toml",
+        "poetry.lock",
+        "pdm.lock",
+        "uv.lock",
+        "pipfile",
+        "pipfile.lock",
+        "setup.py",
+        "setup.cfg",
+        "package.json",
+        "package-lock.json",
+        "npm-shrinkwrap.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "cargo.toml",
+        "cargo.lock",
+        "go.mod",
+        "go.sum",
+        "gemfile",
+        "gemfile.lock",
+        "composer.json",
+        "composer.lock",
+        "mix.exs",
+        "mix.lock",
+        "pubspec.yaml",
+        "pubspec.lock",
+    }:
+        return True
+    return name.startswith("requirements-") and name.endswith(".txt")
 
 
 def _normalize_rel_path(rel_path: str) -> str:

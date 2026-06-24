@@ -33,7 +33,10 @@ class ExecutionPolicyEngine:
     ) -> PolicyDecision:
         hard_reasons: list[str] = []
         approval_reasons: list[str] = []
-        has_owner_authorization = explicit_command or owner_authored
+        feature_task_types = {"small_feature", "high_risk_feature"}
+        has_owner_authorization = explicit_command or (
+            owner_authored and triage.task_type not in feature_task_types
+        )
 
         if triage.is_rejected:
             hard_reasons.append("任务被分诊器判定为不适合自动执行")
@@ -61,7 +64,7 @@ class ExecutionPolicyEngine:
         if (triage.risk_level == "high" or plan.risk_level == "high") and not self.config.allow_high_risk_autorun:
             approval_reasons.append("风险等级为 high")
 
-        if triage.task_type == "small_feature" and not has_owner_authorization and not self._allow_feature_autorun():
+        if triage.task_type in feature_task_types and not has_owner_authorization and not self._allow_feature_autorun():
             approval_reasons.append("feature 默认不在 issue opened 时自动执行")
 
         reasons = list(hard_reasons)

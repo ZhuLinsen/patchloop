@@ -37,8 +37,9 @@ from agent.execution_policy import ExecutionPolicyEngine
 from agent.github_client import GitHubClient
 from agent.github_write_client import GitHubWriteClient
 from agent.issue_comment_intent import (
+    IssueCommentIntentResult,
+    classify_issue_comment_implementation_intent,
     is_repo_owner_human_issue_comment,
-    issue_comment_requests_implementation,
 )
 from agent.json_utils import extract_json_object
 from agent.patch_inspector import PatchInspector
@@ -915,6 +916,36 @@ def _mark_issue_comment_processed(
     )
 
 
+def _issue_comment_intent_analyzer(issue_number: int, comment_id: int):
+    if controller is None:
+        return None
+    analyzer = getattr(controller, "planner", None)
+    if analyzer is None:
+        return None
+    with_log_context = getattr(analyzer, "with_log_context", None)
+    if callable(with_log_context):
+        return with_log_context(f"issue-comment-intent#{issue_number}:{comment_id}")
+    return analyzer
+
+
+async def _classify_issue_comment_implementation_intent(
+    comment_body: str,
+    *,
+    issue: dict,
+    comment_id: int,
+) -> IssueCommentIntentResult:
+    assert config
+    issue_number = int(issue.get("number", 0) or 0)
+    analyzer = _issue_comment_intent_analyzer(issue_number, comment_id)
+    return await asyncio.to_thread(
+        classify_issue_comment_implementation_intent,
+        comment_body,
+        analyzer=analyzer,
+        issue_title=str(issue.get("title", "") or ""),
+        repo_name=str(getattr(config.github, "repo", "") or ""),
+    )
+
+
 async def _handle_issue_comment_event(data: dict, *, source: str):
     """处理 issue_comment 事件。
 
@@ -948,12 +979,42 @@ async def _handle_issue_comment_event(data: dict, *, source: str):
     if not issue_number or not comment_body:
         return
 
-    # 只接受语义明确的实现指令评论
-    if not issue_comment_requests_implementation(comment_body):
-        logger.debug(
-            "Issue #%s 评论不包含明确实现意图，跳过 (comment_id=%s)",
+    if config is None:
+        return
+
+    intent = await _classify_issue_comment_implementation_intent(
+        comment_body,
+        issue=issue,
+        comment_id=comment_id,
+    )
+
+    # 只接受语义明确的实现指令评论；模型不可用时才由正则兜底。
+    if not intent.requests_implementation:
+        logger.info(
+            "Issue #%s 评论不包含明确实现意图，跳过 (comment_id=%s source=%s confidence=%.2f reason=%s)",
             issue_number, comment_id,
+            intent.source,
+            intent.confidence,
+            intent.reason,
         )
+        repo_owner = str(config.github.owner or "").lower()
+        if commenter.lower() == repo_owner or intent.degraded:
+            _record_state_event(
+                category="issue_comment",
+                message=f"Ignored issue comment on #{issue_number} because no implement intent was detected",
+                source=source,
+                target_kind="issue",
+                target_number=issue_number,
+                details={
+                    "comment_id": comment_id,
+                    "commenter": commenter,
+                    "reason": "no_implement_intent",
+                    "intent_source": intent.source,
+                    "intent_reason": intent.reason,
+                    "intent_confidence": intent.confidence,
+                    "intent_degraded": intent.degraded,
+                },
+            )
         _mark_issue_comment_processed(
             comment_id=comment_id,
             issue_number=issue_number,
@@ -964,8 +1025,6 @@ async def _handle_issue_comment_event(data: dict, *, source: str):
         return
 
     # 只接受仓库 owner 的评论
-    if config is None:
-        return
     if not bool(getattr(getattr(config, "autocode", None), "allow_feature_on_comment", True)):
         logger.info(
             "Issue #%s 收到实现指令，但当前已关闭评论触发执行，跳过",
@@ -1033,7 +1092,15 @@ async def _handle_issue_comment_event(data: dict, *, source: str):
         source=source,
         target_kind="issue",
         target_number=issue_number,
-        details={"comment_id": comment_id, "commenter": commenter, "trigger": "implement_comment"},
+        details={
+            "comment_id": comment_id,
+            "commenter": commenter,
+            "trigger": "implement_comment",
+            "intent_source": intent.source,
+            "intent_reason": intent.reason,
+            "intent_confidence": intent.confidence,
+            "intent_degraded": intent.degraded,
+        },
     )
     _queue_issue_execution_task(
         issue,

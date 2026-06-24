@@ -9,6 +9,7 @@ from agent.state_store import (
     build_activity_fingerprint,
     build_issue_processing_key,
     build_pr_review_key,
+    build_pr_review_metadata,
 )
 
 
@@ -20,6 +21,12 @@ class StateStoreReviewKeyTests(unittest.TestCase):
 
             first_key = build_pr_review_key("abc123", "Title", "Body v1")
             second_key = build_pr_review_key("abc123", "Title", "Body v2")
+            first_metadata = build_pr_review_metadata("Title", "Body v1")
+            second_metadata = build_pr_review_metadata("Title", "Body v2")
+
+            self.assertEqual(first_key.rsplit(":", 1)[-1], first_metadata["digest"])
+            self.assertNotEqual(first_metadata["body_hash"], second_metadata["body_hash"])
+            self.assertNotEqual(first_metadata["digest"], second_metadata["digest"])
 
             self.assertEqual("claimed", store.try_claim_pr_review(714, first_key, head_sha="abc123"))
             store.release_pr_review(714, first_key, head_sha="abc123")
@@ -30,10 +37,12 @@ class StateStoreReviewKeyTests(unittest.TestCase):
                 head_sha="abc123",
                 source="test",
                 ci_state="success",
+                review_metadata=first_metadata,
             )
 
             self.assertTrue(store.is_pr_review_processed(714, first_key, head_sha="abc123"))
             self.assertFalse(store.is_pr_review_processed(714, second_key, head_sha="abc123"))
+            self.assertEqual(first_metadata, store.pr_processed_review_metadata(714))
             self.assertEqual("claimed", store.try_claim_pr_review(714, second_key, head_sha="abc123"))
 
     def test_review_key_changes_when_base_ref_changes(self):

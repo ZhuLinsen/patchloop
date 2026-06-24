@@ -13,6 +13,53 @@ import re
 # Issue 分类 Prompt
 # ============================================================
 
+def build_issue_comment_intent_prompt(
+    *,
+    body: str,
+    issue_title: str = "",
+    repo_name: str = "",
+) -> str:
+    """判断 issue 评论是否是在要求 AutoCode 写代码并提交 PR。"""
+    repo_section = f"\n**仓库**: {repo_name}" if repo_name else ""
+    title_section = f"\n**Issue 标题**: {issue_title}" if issue_title else ""
+    return f"""\
+你是一个 GitHub Issue 评论意图分类器。你的任务是判断下面这条评论是否是在明确要求 AutoCode 进入写代码、修复、继续处理或提交 PR 的流程。
+
+## 判定为 IMPLEMENT 的情况
+
+- 明确要求实现、修复、改代码、处理问题、继续修、重新修、开 PR 或提交 PR
+- 对已有分析、方案、方向表达执行批准，例如“按这个方案做”“可以直接修”“进行修复”“开始修复”
+- 反馈当前问题仍未解决，并要求继续尝试，例如“还是不行，继续修”
+- 英文同义表达，例如 “please fix it”“go ahead”“open a PR”“ship it”
+
+## 判定为 IGNORE 的情况
+
+- 只是感谢、确认收到、补充上下文、普通讨论或提问
+- 明确否定执行，例如“不用实现”“先别修”“无需 PR”“已实现”“已经修复”
+- 只是说明现状“还未实现”“需要实现”，但没有要求 AutoCode 现在执行
+- 明确说不需要代码 PR、改配置即可、人工处理即可
+- 自动机器人回复、模板性分析、审查意见摘要
+
+## 重要要求
+
+- 关注评论的真实语义，不要只按关键词判断。
+- 如果评论同时包含直接执行命令和附加要求，例如“实现，记得补测试”，应判为 IMPLEMENT。
+- 如果语义不确定，判为 IGNORE。
+
+## 评论信息
+{repo_section}{title_section}
+
+**评论正文**:
+{body or "无"}
+
+## 输出要求
+
+严格输出 JSON，不要包含其他文字:
+```json
+{{"intent": "IMPLEMENT 或 IGNORE", "reason": "简短中文理由", "confidence": 0.0到1.0之间的数字}}
+```"""
+
+
 def build_issue_classify_prompt(
     title: str,
     body: str,
@@ -892,7 +939,7 @@ def build_unanswerable_reply(reason: str) -> str:
 REPLY_FOOTER = "\n\n---\n*🤖 此回复由 AutoCode Bot 自动生成，仅供参考。如有疑问请 @维护者。*"
 
 _LOCAL_FILE_LINK_RE = re.compile(r"\[([^\]]+)\]\((/[^)]+)\)")
-# Strip raw absolute paths that leak local directory structure (e.g. /home/user/...)
+# Strip raw absolute paths that leak local directory structure (e.g. /home/ubuntu/...)
 _RAW_LOCAL_PATH_RE = re.compile(r"/home/\S+")
 _TRACE_LINE_RE = re.compile(
     r"^\s*(?:●|└|├|│|┌|┐|┘|\$"
@@ -966,7 +1013,7 @@ def _summarize_unanswerable_reason(reason: str) -> str:
 def sanitize_public_reply(content: str) -> str:
     """清理不适合直接发到 GitHub 的本地链接、工具轨迹和内部分析标题。"""
     sanitized = _LOCAL_FILE_LINK_RE.sub(lambda match: f"`{match.group(1)}`", content)
-    # Strip raw local filesystem paths (e.g. /home/user/autocode-xxx/src/foo.py)
+    # Strip raw local filesystem paths (e.g. /home/ubuntu/autocode-xxx/src/foo.py)
     sanitized = _RAW_LOCAL_PATH_RE.sub(
         lambda m: "`" + m.group(0).rsplit("/", 1)[-1] + "`" if "/" in m.group(0) else "",
         sanitized,

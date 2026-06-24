@@ -94,7 +94,7 @@ class ExecutionPolicyTests(unittest.TestCase):
         self.assertTrue(decision.allowed)
         self.assertEqual([], decision.reasons)
 
-    def test_owner_authored_small_feature_counts_as_approval(self):
+    def test_owner_authored_small_feature_still_requires_explicit_approval(self):
         config = AutoCodeConfig(
             enabled=True,
             allow_feature_on_comment=False,
@@ -128,8 +128,9 @@ class ExecutionPolicyTests(unittest.TestCase):
             owner_authored=True,
         )
 
-        self.assertTrue(decision.allowed)
-        self.assertEqual([], decision.reasons)
+        self.assertFalse(decision.allowed)
+        self.assertTrue(any("small_feature" in reason for reason in decision.reasons))
+        self.assertTrue(any("feature 默认" in reason for reason in decision.reasons))
 
     def test_explicit_command_counts_as_manual_approval_for_high_risk_bugfix(self):
         config = AutoCodeConfig(

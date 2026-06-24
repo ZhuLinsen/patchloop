@@ -66,6 +66,17 @@ def build_pr_review_key(
     discussion_fingerprint: str = "",
 ) -> str:
     """为一次 PR review 构造稳定 key，覆盖代码、描述和目标分支变更。"""
+    digest = build_pr_review_metadata(title, body, base_ref, discussion_fingerprint)["digest"]
+    return f"{head_sha}:{digest}" if head_sha else digest
+
+
+def build_pr_review_metadata(
+    title: str,
+    body: str,
+    base_ref: str = "",
+    discussion_fingerprint: str = "",
+) -> dict[str, str]:
+    """构造 PR review key 的可观测元数据指纹，不保存完整标题或正文。"""
     normalized_title = title.strip()
     normalized_body = body.strip()
     normalized_base_ref = base_ref.strip()
@@ -73,7 +84,15 @@ def build_pr_review_key(
     digest = hashlib.sha256(
         f"{normalized_base_ref}\n{normalized_title}\n\n{normalized_body}\n\n{normalized_discussion}".encode("utf-8")
     ).hexdigest()[:16]
-    return f"{head_sha}:{digest}" if head_sha else digest
+    return {
+        "base_ref": normalized_base_ref,
+        "title_hash": hashlib.sha256(normalized_title.encode("utf-8")).hexdigest()[:12],
+        "body_hash": hashlib.sha256(normalized_body.encode("utf-8")).hexdigest()[:12],
+        "discussion_hash": hashlib.sha256(normalized_discussion.encode("utf-8")).hexdigest()[:12]
+        if normalized_discussion
+        else "",
+        "digest": digest,
+    }
 
 
 def _parse_iso_datetime(value: str) -> datetime | None:
@@ -353,6 +372,19 @@ class LocalStateStore:
         with self._lock:
             pr = self._data["pull_requests"].get(str(pr_number), {})
             return str(pr.get("last_processed_at", "") or "")
+
+    def pr_processed_review_key(self, pr_number: int) -> str:
+        with self._lock:
+            pr = self._data["pull_requests"].get(str(pr_number), {})
+            return str(pr.get("last_processed_review_key", "") or "")
+
+    def pr_processed_review_metadata(self, pr_number: int) -> dict[str, str]:
+        with self._lock:
+            pr = self._data["pull_requests"].get(str(pr_number), {})
+            metadata = pr.get("last_processed_review_metadata", {})
+            if not isinstance(metadata, dict):
+                return {}
+            return {str(key): str(value or "") for key, value in metadata.items()}
 
     def has_pr_review_processing_keys(self, pr_number: int) -> bool:
         with self._lock:
@@ -794,6 +826,7 @@ class LocalStateStore:
         ci_state: str = "",
         created_at: str = "",
         updated_at: str = "",
+        review_metadata: dict[str, str] | None = None,
     ):
         with self._lock:
             pr = self._data["pull_requests"].setdefault(str(pr_number), {})
@@ -805,22 +838,23 @@ class LocalStateStore:
             processed_keys = self._append_processed_key(processed_keys, review_key)
             for extra_key in extra_review_keys or []:
                 processed_keys = self._append_processed_key(processed_keys, extra_key)
-            pr.update(
-                {
-                    "created_at": created_at or pr.get("created_at", ""),
-                    "updated_at": updated_at,
-                    "last_seen_head_sha": head_sha,
-                    "last_seen_ci_state": ci_state,
-                    "last_seen_at": utc_now_iso(),
-                    "last_processed_head_sha": head_sha,
-                    "last_processed_review_key": review_key,
-                    "processed_review_keys": processed_keys,
-                    "last_review_submission_cursor_at": review_submission_cursor_at,
-                    "last_processed_updated_at": processed_updated_at,
-                    "last_processed_at": utc_now_iso(),
-                    "source": source,
-                }
-            )
+            updates = {
+                "created_at": created_at or pr.get("created_at", ""),
+                "updated_at": updated_at,
+                "last_seen_head_sha": head_sha,
+                "last_seen_ci_state": ci_state,
+                "last_seen_at": utc_now_iso(),
+                "last_processed_head_sha": head_sha,
+                "last_processed_review_key": review_key,
+                "processed_review_keys": processed_keys,
+                "last_review_submission_cursor_at": review_submission_cursor_at,
+                "last_processed_updated_at": processed_updated_at,
+                "last_processed_at": utc_now_iso(),
+                "source": source,
+            }
+            if review_metadata is not None:
+                updates["last_processed_review_metadata"] = dict(review_metadata)
+            pr.update(updates)
             self._save_unlocked()
 
     def mark_pr_blocked(

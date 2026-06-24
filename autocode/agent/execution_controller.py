@@ -4,7 +4,6 @@ from __future__ import annotations
 import logging
 import re
 import subprocess
-import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -27,11 +26,18 @@ from agent.execution_policy import ExecutionPolicyEngine
 from agent.github_client import GitHubClient
 from agent.github_write_client import GitHubWriteClient
 from agent.issue_comment_intent import (
+    classify_issue_comment_implementation_intent,
     is_repo_owner_human_issue_comment,
-    issue_comment_requests_implementation,
 )
 from agent.issue_classifier import classify_issue
 from agent.patch_inspector import PatchInspectionResult, PatchInspector, is_documentation_scope_path
+from agent.pr_title import (
+    build_pr_title,
+    is_usable_pr_title,
+    normalize_pr_title_issue_text,
+    should_keep_existing_pr_title,
+    truncate_pr_title_subject,
+)
 from agent.validation_runner import ValidationResult, ValidationRunner, ValidationStepResult
 from agent.workspace_manager import WorkspaceManager
 from config import AppConfig
@@ -113,16 +119,6 @@ _ACTIONABLE_SELF_REVIEW_MARKERS = (
 _ACTIONABLE_SELF_REVIEW_REFERENCE_RE = re.compile(
     r"`[^`]+`|(?:^|[\s(])(?:src|tests|docs|scripts|app|bot|agent|adapters|data_provider|data|projects)/\S+",
     re.IGNORECASE,
-)
-_ISSUE_TITLE_PREFIX_RE = re.compile(r"^\[(bug|feature|docs|question)\]\s*", re.IGNORECASE)
-_INFORMAL_TITLE_RE = re.compile(
-    r"[？?吗呢吧嘛]\s*$|[？?吗]|^(?:为什么|为啥|怎么|如何|能否|能不能|能新增|能增加|能加|可以|可否|请问|是否|有没有|是不是)",
-)
-_VERBOSE_TITLE_MAX_LEN = 30  # titles longer than this prefer plan_goal when available
-_PLACEHOLDER_TITLE_RE = re.compile(r"^[\s(#\d)]*$")
-_LOW_SIGNAL_TITLE_PREFIX_RE = re.compile(r"^(?:今天|昨天|刚刚|现在|目前|突然|又|还是|这边|这里|那边|这个|这块|好像|似乎)")
-_LOW_SIGNAL_TITLE_SUFFIX_RE = re.compile(
-    r"(?:跑不动(?:了)?|起不来(?:了)?|用不了(?:了)?|不工作(?:了)?|有问题(?:了)?|出问题(?:了)?|挂了|坏了|不行了|崩了|炸了)$"
 )
 _PR_LINKED_ISSUE_RE = re.compile(r"\b(?:fix(?:e[sd])?|close[sd]?|resolve[sd]?)\s+#(\d+)\b", re.IGNORECASE)
 _PR_TITLE_ISSUE_RE = re.compile(r"\(#(\d+)\)\s*$")
@@ -534,7 +530,19 @@ class ExecutionController:
                 continue
             if any(pattern.search(body) for pattern in _NON_PR_REDIRECT_PATTERNS):
                 return "redirect", body
-            if issue_comment_requests_implementation(body):
+            intent = classify_issue_comment_implementation_intent(
+                body,
+                analyzer=self._planner_with_context("issue-comment-intent"),
+                repo_name=str(getattr(getattr(self.config, "github", None), "repo", "") or ""),
+            )
+            logger.info(
+                "issue-comment-intent: owner comment classified source=%s confidence=%.2f reason=%s implement=%s",
+                intent.source,
+                intent.confidence,
+                intent.reason,
+                intent.requests_implementation,
+            )
+            if intent.requests_implementation:
                 return "implement", body
         return "", ""
 
@@ -1152,7 +1160,7 @@ class ExecutionController:
                 )
                 if existing_pr is not None:
                     pr_number = int(existing_pr.get("number", 0) or 0)
-                    updated_pr = self.gh_writer.update_pull_request(pr_number, title=pr_title, body=pr_body)
+                    updated_pr = self.gh_writer.update_pull_request(pr_number, title=pr_title)
                     pr = updated_pr or existing_pr
                 elif not dry_run:
                     pr_cap_reason = self._check_open_pr_cap()
@@ -1458,34 +1466,31 @@ class ExecutionController:
 
         # Only rebase PRs that actually have merge conflicts.
         # Fetch the single-PR detail to get mergeable_state (list endpoint
-        # does not include it).  Skip rebase when the PR has no conflicts
-        # to avoid unnecessary force-pushes that re-run CI and disrupt
-        # review history.
+        # does not include it).  Treat unknown as a non-actionable transient
+        # GitHub state; rebasing on it rewrites reviewed heads and reruns CI
+        # without proving there is a real conflict.
         try:
             pr_detail = self.gh.get_pr(pr_number)
             mergeable_state = str(pr_detail.get("mergeable_state", "") or "").lower()
-            if mergeable_state and mergeable_state not in ("dirty", "unknown"):
+            if mergeable_state != "dirty":
                 self.state_store.clear_tracked_pr_rebase_failure(pr_number)
                 logger.debug(
-                    "pr-rebase: PR #%s mergeable_state=%s (无冲突)，跳过 rebase",
+                    "pr-rebase: PR #%s mergeable_state=%s (未确认冲突)，跳过 rebase",
                     pr_number,
-                    mergeable_state,
+                    mergeable_state or "-",
                 )
                 return None
-            if mergeable_state:
-                logger.info(
-                    "pr-rebase: PR #%s mergeable_state=%s，需要 rebase",
-                    pr_number,
-                    mergeable_state,
-                )
+            logger.info(
+                "pr-rebase: PR #%s mergeable_state=dirty，需要 rebase",
+                pr_number,
+            )
         except Exception as exc:
-            # If we can't fetch PR detail, fall through and let the local
-            # rebase logic decide (it returns False if already up-to-date).
-            logger.debug(
-                "pr-rebase: PR #%s 无法获取 mergeable_state (%s)，继续本地检查",
+            logger.info(
+                "pr-rebase: PR #%s 无法确认 mergeable_state (%s)，跳过 rebase",
                 pr_number,
                 exc,
             )
+            return None
 
         try:
             self._sync_repo_before_task("pr rebase check")
@@ -2086,6 +2091,130 @@ class ExecutionController:
             return False
         return False
 
+    def _review_feedback_commit_message(self, pr_number: int, feedback: list[dict]) -> str:
+        summary = self._review_feedback_commit_summary(feedback)
+        return f"fix(review-feedback-{pr_number}): {summary}"
+
+    def _review_feedback_commit_summary(self, feedback: list[dict]) -> str:
+        summaries: list[str] = []
+        seen: set[str] = set()
+        for item in feedback:
+            summary = self._commit_summary_from_feedback_item(item)
+            if not summary or summary in seen:
+                continue
+            seen.add(summary)
+            summaries.append(summary)
+            if len(summaries) >= 2:
+                break
+        if summaries:
+            combined = " and ".join(summaries)
+            return self._shorten_commit_summary(combined)
+
+        paths = []
+        for item in feedback:
+            path = str(item.get("path", "") or "").strip()
+            if path and path not in paths:
+                paths.append(path)
+        if paths:
+            names = ", ".join(Path(path).name for path in paths[:2])
+            return self._shorten_commit_summary(f"update {names} from review feedback")
+        return "apply targeted review feedback"
+
+    def _commit_summary_from_feedback_item(self, item: dict) -> str:
+        body = str(item.get("body", "") or "").strip()
+        if not body:
+            return ""
+
+        if self._looks_like_openreview_review_body(body):
+            openreview_summary = self._openreview_commit_summary(body)
+            if openreview_summary:
+                return openreview_summary
+
+        cleaned = self._clean_commit_summary_text(body)
+        if not cleaned:
+            return ""
+
+        for pattern, prefix in (
+            (r"(?i)\bconsider\s+([^。.;\n]+)", ""),
+            (r"(?i)\bplease\s+([^。.;\n]+)", ""),
+            (r"(?i)\badding\s+([^。.;\n]+)", "add "),
+            (r"(?i)\badd\s+([^。.;\n]+)", "add "),
+            (r"(?i)\bupdate\s+([^。.;\n]+)", "update "),
+            (r"(?i)\bfix\s+([^。.;\n]+)", "fix "),
+            (r"(?i)\bpreserve\s+([^。.;\n]+)", "preserve "),
+        ):
+            match = re.search(pattern, cleaned)
+            if not match:
+                continue
+            phrase = self._normalize_commit_summary_phrase(prefix + match.group(1))
+            if phrase:
+                return self._shorten_commit_summary(phrase)
+
+        first_clause = re.split(r"[。.;；]\s+", cleaned, maxsplit=1)[0]
+        fallback = first_clause if len(first_clause) >= 12 else cleaned
+        return self._shorten_commit_summary(self._normalize_commit_summary_phrase(fallback))
+
+    def _openreview_commit_summary(self, body: str) -> str:
+        cleaned = self._clean_commit_summary_text(body)
+        for pattern in (
+            r"(?:需先|需要先)([^。；;]+)",
+            r"建议[^。；;]*?(补[^。；;]+)",
+            r"\[(?:Correctness|Process|Security|Regression) blocker\]\s*([^。；;]+)",
+        ):
+            match = re.search(pattern, cleaned, re.IGNORECASE)
+            if not match:
+                continue
+            phrase = self._normalize_commit_summary_phrase(match.group(1))
+            if phrase:
+                return self._shorten_commit_summary(phrase)
+        return ""
+
+    @staticmethod
+    def _clean_commit_summary_text(text: str) -> str:
+        cleaned = re.sub(r"<!--.*?-->", " ", str(text or ""), flags=re.DOTALL)
+        cleaned = re.sub(r"```.*?```", " ", cleaned, flags=re.DOTALL)
+        cleaned = re.sub(r"!\[[^\]]*\]\([^)]+\)", " ", cleaned)
+        cleaned = re.sub(r"`([^`]+)`", r"\1", cleaned)
+        cleaned = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", cleaned)
+        cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+        cleaned = re.sub(r"https?://\S+", " ", cleaned)
+        cleaned = re.sub(r"\n\s*\n+", ". ", cleaned)
+        cleaned = re.sub(r"[*_#>\|]+", " ", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        return cleaned.strip(" -:：.;。")
+
+    @staticmethod
+    def _normalize_commit_summary_phrase(text: str) -> str:
+        phrase = " ".join(str(text or "").split())
+        phrase = re.sub(r"(?i)\bwould help\b.*$", "", phrase)
+        phrase = re.sub(r"(?i)\bto prevent\b.*$", "", phrase)
+        phrase = re.sub(r"(?i)\bacross providers\b.*$", "", phrase)
+        phrase = re.sub(r"\s*\([^)]*\)", "", phrase)
+        phrase = re.sub(r"\s*\([^)]*$", "", phrase)
+        phrase = phrase.strip(" -:：.;。")
+        replacements = (
+            ("reading ", "read "),
+            ("adding ", "add "),
+            ("updating ", "update "),
+            ("fixing ", "fix "),
+            ("preserving ", "preserve "),
+        )
+        lowered = phrase.lower()
+        for old, new in replacements:
+            if lowered.startswith(old):
+                return new + phrase[len(old):].strip()
+        return phrase
+
+    @staticmethod
+    def _shorten_commit_summary(summary: str, *, limit: int = 72) -> str:
+        cleaned = " ".join(str(summary or "").split()).strip(" -:：.;。")
+        if len(cleaned) <= limit:
+            return cleaned
+        candidate = cleaned[:limit].rstrip()
+        if " " in candidate:
+            candidate = candidate.rsplit(" ", 1)[0]
+        return candidate.strip(" -:：.;。") or cleaned[:limit].strip(" -:：.;。")
+
     def _apply_review_feedback(self, pr: dict, feedback: list[dict]) -> str:
         pr_number = int(pr["number"])
         head_ref = str(pr.get("head", {}).get("ref", "") or "")
@@ -2384,27 +2513,12 @@ class ExecutionController:
                     )
                     self.workspace_manager.commit_all(
                         workspace.path,
-                        f"fix(review-feedback-{pr_number}): address latest review comments",
+                        self._review_feedback_commit_message(pr_number, feedback),
                     )
                     self.workspace_manager.push_branch(workspace.path, workspace.branch_name, force=rebased)
                     if pr_planning is not None:
-                        # 等待 GitHub 重新计算 diff 统计，避免 PR 描述与实际不一致
-                        time.sleep(12)
-                        live_inspection, existing_pr_body = self._live_patch_inspection_for_pr(pr)
-                        refreshed_body = self._build_pr_body(
-                            issue_number=pr_planning.issue_number,
-                            task_type=pr_planning.triage.task_type,
-                            issue_labels=pr_planning.labels,
-                            explicit_command=False,
-                            plan=pr_planning.plan,
-                            validation=validation,
-                            inspection=live_inspection,
-                            execution_summary=cli_output,
-                            existing_pr_body=existing_pr_body,
-                        )
-                        self.gh_writer.update_pull_request(pr_number, body=refreshed_body)
                         logger.info(
-                            "pr-feedback: PR #%s 已根据最新 diff 刷新 PR 描述 issue=%s",
+                            "pr-feedback: PR #%s 已推送代码修复，保留现有 PR 描述以避免覆盖人工编辑 issue=%s",
                             pr_number,
                             pr_planning.issue_number,
                         )
@@ -2914,10 +3028,10 @@ class ExecutionController:
         mode = self.config.autocode.mode
         if mode == "manual":
             return False
-        # 普通用户的 feature 仍保守处理；repo owner 自己创建的 issue 视为已授权执行。
+        # Feature 默认只生成计划；即使 issue 是 repo owner 创建，也需要显式
+        # implement 评论/API 才进入代码实现，避免把个人记录的想法自动落地。
+        del owner_authored_issue
         auto_types = {"bug_fix", "todo_refactor"}
-        if owner_authored_issue:
-            auto_types.update({"small_feature", "high_risk_feature"})
         if mode == "semi_auto":
             return triage.task_type in auto_types and self.config.autocode.auto_implement_on_issue_open
         return self.config.autocode.auto_implement_on_issue_open and triage.task_type in auto_types
@@ -2948,68 +3062,32 @@ class ExecutionController:
     }
 
     def _normalize_pr_title_issue_text(self, title: str) -> str:
-        normalized = _ISSUE_TITLE_PREFIX_RE.sub("", title.strip()).strip()
-        # 如果去掉 [Bug]/[Feature] 前缀后内容不足 5 个字符，视为空泛标题返回空字符串。
-        if len(normalized) < 5:
-            return ""
-        return normalized
+        return normalize_pr_title_issue_text(title)
 
     @staticmethod
     def _is_usable_pr_title(text: str) -> bool:
-        """Return False if text is empty, placeholder-only, or a user question."""
-        if not text or _PLACEHOLDER_TITLE_RE.match(text):
-            return False
-        if _INFORMAL_TITLE_RE.search(text):
-            return False
-        compact = re.sub(r"\s+", "", text)
-        if _LOW_SIGNAL_TITLE_PREFIX_RE.match(compact):
-            return False
-        if _LOW_SIGNAL_TITLE_SUFFIX_RE.search(compact):
-            return False
-        return True
+        return is_usable_pr_title(text)
 
     @staticmethod
     def _truncate_title(text: str, max_len: int = 50) -> str:
-        if len(text) <= max_len:
-            return text
-        cut = text[:max_len]
-        # Try word boundary for mixed CJK/Latin text
-        for sep in ("，", "、", "；", ",", " "):
-            head, _, _ = cut.rpartition(sep)
-            if head and len(head) >= max_len // 2:
-                cut = head
-                break
-        return cut.rstrip("，。、,. ") + "…"
+        return truncate_pr_title_subject(text, max_len=max_len)
 
     def _build_pr_title(self, task_type: str, title: str, issue_number: int, *, plan_goal: str = "") -> str:
-        prefix = self._TASK_TYPE_PREFIX_MAP.get(task_type, "chore")
-        short_title = self._normalize_pr_title_issue_text(title)
-        goal_first_sentence = plan_goal.split("。")[0].split("\n")[0].strip() if plan_goal else ""
-        if not self._is_usable_pr_title(short_title) or (
-            len(short_title) > _VERBOSE_TITLE_MAX_LEN and goal_first_sentence
-        ):
-            short_title = goal_first_sentence
-        if not short_title:
-            short_title = f"resolve issue #{issue_number}"
-        short_title = self._truncate_title(short_title)
-        return f"{prefix}: {short_title} (#{issue_number})"
+        return build_pr_title(
+            task_type,
+            title,
+            issue_number,
+            plan_goal=plan_goal,
+            prefix_map=self._TASK_TYPE_PREFIX_MAP,
+        )
 
     def _should_keep_existing_pr_title(self, existing_title: str, task_type: str, issue_number: int) -> bool:
-        title = str(existing_title or "").strip()
-        if not title:
-            return False
-        expected_prefix = f"{self._TASK_TYPE_PREFIX_MAP.get(task_type, 'chore')}: "
-        if not title.lower().startswith(expected_prefix):
-            return False
-        match = _PR_TITLE_ISSUE_RE.search(title)
-        if not match or int(match.group(1)) != issue_number:
-            return False
-        short_title = title[len(expected_prefix) : match.start()].strip()
-        # 去掉 [Bug]/[Feature] 前缀后不足 5 个有效字符的标题视为空泛。
-        cleaned = _ISSUE_TITLE_PREFIX_RE.sub("", short_title).strip()
-        if len(cleaned) < 5:
-            return False
-        return self._is_usable_pr_title(short_title)
+        return should_keep_existing_pr_title(
+            existing_title,
+            task_type,
+            issue_number,
+            prefix_map=self._TASK_TYPE_PREFIX_MAP,
+        )
 
     def _build_pr_body(
         self,

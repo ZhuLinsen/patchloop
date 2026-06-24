@@ -54,6 +54,7 @@ from agent.state_store import (
     build_activity_fingerprint,
     build_issue_processing_key,
     build_pr_review_key,
+    build_pr_review_metadata,
 )
 
 # ------------------------------------------------------------------
@@ -87,6 +88,89 @@ PR_BLOCKED_NOTIFY_COOLDOWN_SECONDS = 1800
 _AUTOCODE_COMMAND_RE = re.compile(r"(?mi)^\s*/(plan|implement|retry|abort|status)\b")
 _IDEMPOTENCY_MARKER_PREFIX = "openreview:idempotency"
 _IDEMPOTENCY_LOOKBACK_LIMIT = 200
+
+
+def _short_review_key(review_key: str) -> str:
+    return review_key[:24] or "unknown"
+
+
+def _review_key_digest(review_key: str) -> str:
+    if ":" not in review_key:
+        return review_key
+    return review_key.rsplit(":", 1)[-1]
+
+
+def _pr_review_metadata_change_reasons(
+    previous_metadata: dict[str, str],
+    current_metadata: dict[str, str],
+) -> list[str]:
+    if not previous_metadata:
+        return ["metadata_changed_without_component_history"]
+
+    checks = (
+        ("base_ref", "base_ref_changed"),
+        ("title_hash", "title_changed"),
+        ("body_hash", "body_changed"),
+        ("discussion_hash", "discussion_changed"),
+    )
+    changes = [
+        reason
+        for field, reason in checks
+        if str(previous_metadata.get(field, "") or "") != str(current_metadata.get(field, "") or "")
+    ]
+    if changes:
+        return changes
+    if str(previous_metadata.get("digest", "") or "") != str(current_metadata.get("digest", "") or ""):
+        return ["metadata_digest_changed"]
+    return ["review_key_changed"]
+
+
+def _log_pr_review_key_decision(
+    pr_number: int,
+    *,
+    review_key: str,
+    initial_review_key: str,
+    head_sha: str,
+    source: str,
+    followup_mode: bool,
+    current_metadata: dict[str, str],
+):
+    if not state_store:
+        return
+    previous_key = state_store.pr_processed_review_key(pr_number)
+    if not previous_key or previous_key == review_key:
+        return
+
+    previous_head = state_store.pr_processed_head_sha(pr_number)
+    previous_metadata = state_store.pr_processed_review_metadata(pr_number)
+    if previous_head and previous_head != head_sha:
+        reasons = ["head_changed"]
+    elif followup_mode and review_key != initial_review_key:
+        reasons = _pr_review_metadata_change_reasons(previous_metadata, current_metadata)
+        if reasons == ["metadata_changed_without_component_history"]:
+            reasons = ["discussion_or_ci_followup_changed"]
+    else:
+        reasons = _pr_review_metadata_change_reasons(previous_metadata, current_metadata)
+
+    logger.info(
+        "PR #%d 触发新的 review key: reasons=%s, previous_key=%s, current_key=%s, "
+        "previous_digest=%s, current_digest=%s, previous_head=%s, current_head=%s, "
+        "base_ref=%s, title_hash=%s, body_hash=%s, discussion_hash=%s, source=%s, followup=%s",
+        pr_number,
+        ",".join(reasons),
+        _short_review_key(previous_key),
+        _short_review_key(review_key),
+        _review_key_digest(previous_key),
+        current_metadata.get("digest", ""),
+        previous_head[:12] or "unknown",
+        head_sha[:12] or "unknown",
+        current_metadata.get("base_ref", ""),
+        current_metadata.get("title_hash", ""),
+        current_metadata.get("body_hash", ""),
+        current_metadata.get("discussion_hash", ""),
+        source,
+        followup_mode,
+    )
 
 
 def _build_idempotency_marker(kind: str, key: str) -> str:
@@ -1263,6 +1347,7 @@ async def _process_pr_serialized(
 
     initial_review_key = build_pr_review_key(head_sha, title, body, base_ref)
     review_key = initial_review_key
+    review_key_discussion_fingerprint = ""
     event_review_key = ""
     followup_mode = False
     discussion_context = ""
@@ -1349,6 +1434,7 @@ async def _process_pr_serialized(
             discussion_fingerprint=activity_fingerprint,
         )
         review_key = event_review_key
+        review_key_discussion_fingerprint = activity_fingerprint
         followup_mode = initial_processed and review_key != initial_review_key
         if review_key != initial_review_key and not initial_processed:
             extra_review_keys.append(initial_review_key)
@@ -1370,6 +1456,7 @@ async def _process_pr_serialized(
                     updated_at=updated_at,
                 ):
                     review_key = candidate_key
+                    review_key_discussion_fingerprint = ci_failure_fingerprint
                     followup_mode = True
                     discussion_context = _build_ci_failure_discussion_context(ci_status)
                     logger.info("PR #%d 无新外部讨论，但 CI 失败，触发一次跟进评审", pr_number)
@@ -1400,6 +1487,7 @@ async def _process_pr_serialized(
                     updated_at=updated_at,
                 ):
                     review_key = candidate_key
+                    review_key_discussion_fingerprint = ci_failure_fingerprint
                     followup_mode = True
                     discussion_context = _build_ci_failure_discussion_context(ci_status)
                     logger.info("PR #%d 外部讨论已处理，但 CI 失败，触发一次跟进评审", pr_number)
@@ -1426,6 +1514,7 @@ async def _process_pr_serialized(
                 logger.info("PR #%d 的最新讨论已处理过，跳过", pr_number)
                 return False
             review_key = candidate_key
+            review_key_discussion_fingerprint = latest_runtime_activity_fingerprint
             followup_mode = True
     elif compat_processed:
         logger.info("PR #%d 当前版本已处理过，且没有新的讨论信号，跳过", pr_number)
@@ -1468,8 +1557,10 @@ async def _process_pr_serialized(
                 if review_key and review_key not in extra_review_keys:
                     extra_review_keys.append(review_key)
                 review_key = latest_runtime_review_key
+                review_key_discussion_fingerprint = latest_runtime_activity_fingerprint
         else:
             review_key = initial_review_key
+            review_key_discussion_fingerprint = ""
             if event_review_key and event_review_key != initial_review_key and event_review_key not in extra_review_keys:
                 extra_review_keys.append(event_review_key)
             if (
@@ -1478,6 +1569,13 @@ async def _process_pr_serialized(
                 and latest_runtime_review_key not in extra_review_keys
             ):
                 extra_review_keys.append(latest_runtime_review_key)
+
+    current_review_metadata = build_pr_review_metadata(
+        title,
+        body,
+        base_ref,
+        discussion_fingerprint=review_key_discussion_fingerprint,
+    )
 
     claim_status = state_store.try_claim_pr_review(
         pr_number,
@@ -1495,6 +1593,15 @@ async def _process_pr_serialized(
             review_key[:24] or "unknown",
         )
         return False
+    _log_pr_review_key_decision(
+        pr_number,
+        review_key=review_key,
+        initial_review_key=initial_review_key,
+        head_sha=head_sha,
+        source=source,
+        followup_mode=followup_mode,
+        current_metadata=current_review_metadata,
+    )
 
     try:
         review_marker = _build_idempotency_marker("pr-review", review_key)
@@ -1508,6 +1615,7 @@ async def _process_pr_serialized(
                 ci_state=ci_state,
                 created_at=created_at,
                 updated_at=updated_at,
+                review_metadata=current_review_metadata,
             )
             logger.info("PR #%d 检测到已存在相同 review 标记，补记本地状态并跳过重复发送", pr_number)
             return False
@@ -1617,6 +1725,7 @@ async def _process_pr_serialized(
             ci_state=ci_state,
             created_at=created_at,
             updated_at=updated_at,
+            review_metadata=current_review_metadata,
         )
         logger.info("已%s PR #%d (source=%s)", "跟进评审" if followup_mode else "review", pr_number, source)
         return True

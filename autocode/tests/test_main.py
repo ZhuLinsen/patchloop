@@ -71,7 +71,7 @@ class FakeGitHubWriter:
             "state": "open",
             "updated_at": "2026-03-27T08:58:41Z",
             "created_at": "2026-03-27T08:58:41Z",
-            "user": {"login": "maintainer", "type": "User"},
+            "user": {"login": "ZhuLinsen", "type": "User"},
         }
 
 
@@ -370,7 +370,7 @@ class MainTests(unittest.TestCase):
                 "state": "open",
                 "updated_at": "2026-03-28T12:00:00Z",
                 "labels": [{"name": "autocode"}, {"name": "enhancement"}],
-                "user": {"login": "maintainer", "type": "User"},
+                "user": {"login": "ZhuLinsen", "type": "User"},
             }
 
             with mock.patch.object(
@@ -423,14 +423,14 @@ class MainTests(unittest.TestCase):
                     "state": "open",
                     "updated_at": "2026-03-28T12:00:00Z",
                     "labels": [{"name": "autocode"}],
-                    "user": {"login": "maintainer", "type": "User"},
+                    "user": {"login": "ZhuLinsen", "type": "User"},
                 },
                 {
                     "number": 893,
                     "state": "open",
                     "updated_at": "2026-03-28T12:00:00Z",
                     "labels": [{"name": "autocode"}],
-                    "user": {"login": "maintainer", "type": "User"},
+                    "user": {"login": "ZhuLinsen", "type": "User"},
                 },
             ]
             with mock.patch.object(
@@ -473,7 +473,7 @@ class MainTests(unittest.TestCase):
                     "state": "open",
                     "updated_at": "2026-03-28T12:00:00Z",
                     "labels": [{"name": "autocode"}],
-                    "user": {"login": "maintainer", "type": "User"},
+                    "user": {"login": "ZhuLinsen", "type": "User"},
                 },
             ]
             with mock.patch.object(
@@ -539,21 +539,21 @@ class MainTests(unittest.TestCase):
                     "state": "open",
                     "updated_at": processed_timestamp,
                     "labels": [{"name": "autocode"}, {"name": "enhancement"}],
-                    "user": {"login": "maintainer", "type": "User"},
+                    "user": {"login": "ZhuLinsen", "type": "User"},
                 },
                 {
                     "number": 892,
                     "state": "open",
                     "updated_at": processed_timestamp,
                     "labels": [{"name": "autocode"}, {"name": "enhancement"}],
-                    "user": {"login": "maintainer", "type": "User"},
+                    "user": {"login": "ZhuLinsen", "type": "User"},
                 },
                 {
                     "number": 893,
                     "state": "open",
                     "updated_at": "2026-03-28T12:05:00Z",
                     "labels": [{"name": "autocode"}, {"name": "enhancement"}],
-                    "user": {"login": "maintainer", "type": "User"},
+                    "user": {"login": "ZhuLinsen", "type": "User"},
                 },
             ]
 
@@ -823,6 +823,28 @@ class MainTests(unittest.TestCase):
                 asyncio.run(main._handle_issue_comment_event({"issue": issue, "comment": comment}, source="webhook"))
             queue_fn.assert_called_once()
 
+    def test_handle_issue_comment_uses_llm_intent_before_regex_fallback(self):
+        planner = FakePlanner('{"intent":"IMPLEMENT","reason":"明确修复","confidence":0.92}')
+        with mock.patch.object(main, "config", SimpleNamespace(
+            github=SimpleNamespace(owner="repoowner", repo="demo/repo"),
+            autocode=SimpleNamespace(allow_feature_on_comment=True),
+        )), mock.patch.object(main, "controller", SimpleNamespace(planner=planner)):
+            issue = {
+                "number": 12,
+                "title": "[Bug] report mismatch",
+                "state": "open",
+                "updated_at": "2026-03-24T00:00:00Z",
+            }
+            comment = {
+                "id": 10055,
+                "body": "去处理这个问题",
+                "user": {"login": "repoowner", "type": "User"},
+            }
+            with mock.patch.object(main, "_queue_issue_execution_task") as queue_fn:
+                asyncio.run(main._handle_issue_comment_event({"issue": issue, "comment": comment}, source="webhook"))
+            queue_fn.assert_called_once()
+            self.assertEqual(1, len(planner.prompts))
+
     def test_handle_issue_comment_triggers_on_not_resolved_followup(self):
         with mock.patch.object(main, "config", SimpleNamespace(
             github=SimpleNamespace(owner="repoowner"),
@@ -919,7 +941,7 @@ class MainTests(unittest.TestCase):
                         "id": 1101,
                         "body": "请实现",
                         "updated_at": "2026-03-24T00:01:00Z",
-                        "issue_url": "https://github.com/octo-org/example-repo/issues/42",
+                        "issue_url": "https://github.com/ZhuLinsen/daily_stock_analysis/issues/42",
                         "user": {"login": "repoowner", "type": "User"},
                     }
                 ],
@@ -962,7 +984,7 @@ class MainTests(unittest.TestCase):
                         "id": 1102,
                         "body": "实现",
                         "updated_at": "2026-03-24T00:01:00Z",
-                        "issue_url": "https://github.com/octo-org/example-repo/issues/77",
+                        "issue_url": "https://github.com/ZhuLinsen/daily_stock_analysis/issues/77",
                         "user": {"login": "repoowner", "type": "User"},
                     }
                 ],
@@ -1037,7 +1059,7 @@ class MainTests(unittest.TestCase):
                         "id": 1104,
                         "body": "实现",
                         "updated_at": "2026-03-24T00:01:00Z",
-                        "issue_url": "https://github.com/octo-org/example-repo/issues/404",
+                        "issue_url": "https://github.com/ZhuLinsen/daily_stock_analysis/issues/404",
                         "user": {"login": "repoowner", "type": "User"},
                     }
                 ]
@@ -2099,7 +2121,7 @@ class MainTests(unittest.TestCase):
                 branch_name="feature/pr-41",
                 base_ref="main",
                 head_sha="abc123",
-                author_login="maintainer",
+                author_login="ZhuLinsen",
                 pr_url="https://example.com/pulls/41",
                 queue_source="author_allowlist",
             )
@@ -2320,7 +2342,7 @@ class MainTests(unittest.TestCase):
                 branch_name="feature/pr-822",
                 base_ref="main",
                 head_sha="abc123",
-                author_login="maintainer",
+                author_login="ZhuLinsen",
                 pr_url="https://example.com/pulls/822",
                 queue_source="author_allowlist",
             )
@@ -2373,7 +2395,7 @@ class MainTests(unittest.TestCase):
                 branch_name="autocode/issue-880-bug",
                 base_ref="main",
                 head_sha="abc123",
-                author_login="maintainer",
+                author_login="ZhuLinsen",
                 pr_url="https://example.com/pulls/900",
                 queue_source="autocode_branch",
                 pr_updated_at="2026-03-28T01:57:32Z",
@@ -2560,7 +2582,7 @@ class MainTests(unittest.TestCase):
                         "state": "open",
                         "updated_at": "2026-03-27T09:10:00Z",
                         "created_at": "2026-03-27T09:00:00Z",
-                        "user": {"login": "maintainer", "type": "User"},
+                        "user": {"login": "ZhuLinsen", "type": "User"},
                     }
                 }
             )
@@ -2646,7 +2668,7 @@ class MainTests(unittest.TestCase):
                         "state": "open",
                         "updated_at": issue_updated_at,
                         "created_at": "2026-03-27T09:00:00Z",
-                        "user": {"login": "maintainer", "type": "User"},
+                        "user": {"login": "ZhuLinsen", "type": "User"},
                     }
                 }
             )
@@ -2825,7 +2847,7 @@ class MainTests(unittest.TestCase):
                         "state": "open",
                         "updated_at": "2026-03-27T09:10:00Z",
                         "created_at": "2026-03-27T09:00:00Z",
-                        "user": {"login": "maintainer", "type": "User"},
+                        "user": {"login": "ZhuLinsen", "type": "User"},
                     }
                 }
             )
@@ -3139,7 +3161,7 @@ class MainTests(unittest.TestCase):
                 {
                     "action": "create",
                     "title": "补齐 Actions 配置映射并增加缺失项校验",
-                    "body": "问题出在 `templates/TODO.md` 的同步条目和 `/home/user/projects/demo/app.py:12` 相关逻辑。\n\n来源：`templates/TODO.md:8`\n建议梳理配置入口并补齐映射。",
+                    "body": "问题出在 `projects/daily_stock_analysis_todo.md` 的同步条目和 `/home/mumu/codes/demo/app.py:12` 相关逻辑。\n\n来源：`projects/daily_stock_analysis_todo.md:8`\n建议梳理配置入口并补齐映射。",
                     "labels": ["autocode", "enhancement"],
                     "reason": "rewrite",
                 },
@@ -3157,8 +3179,8 @@ class MainTests(unittest.TestCase):
             )
 
         self.assertEqual("[Feature] 补齐 Actions 配置映射并增加缺失项校验", draft["title"])
-        self.assertNotIn("TODO.md", draft["body"])
-        self.assertNotIn("/home/user/projects", draft["body"])
+        self.assertNotIn("projects/daily_stock_analysis_todo.md", draft["body"])
+        self.assertNotIn("/home/mumu/codes", draft["body"])
         self.assertNotIn("来源：", draft["body"])
         self.assertIn("相关代码位置", draft["body"])
 
@@ -3296,7 +3318,7 @@ class MainTests(unittest.TestCase):
             todo_path = repo / "TODO.md"
             todo_path.write_text(
                 "- [ ] 简化readme，当前的readme内容太多了\n"
-                "  issue: [#883](https://github.com/octo-org/example-repo/issues/883)\n",
+                "  issue: [#883](https://github.com/ZhuLinsen/daily_stock_analysis/issues/883)\n",
                 encoding="utf-8",
             )
             backlog = BacklogSource(
@@ -3339,7 +3361,7 @@ class MainTests(unittest.TestCase):
             todo_path = repo / "TODO.md"
             todo_path.write_text(
                 "- [ ] 简化readme，当前的readme内容太多了\n"
-                "  issue: [#883](https://github.com/octo-org/example-repo/issues/883)\n",
+                "  issue: [#883](https://github.com/ZhuLinsen/daily_stock_analysis/issues/883)\n",
                 encoding="utf-8",
             )
             backlog = BacklogSource(
@@ -3359,7 +3381,7 @@ class MainTests(unittest.TestCase):
                 title=item.title,
                 issue_title=item.title,
                 issue_number=883,
-                issue_url="https://github.com/octo-org/example-repo/issues/883",
+                issue_url="https://github.com/ZhuLinsen/daily_stock_analysis/issues/883",
                 sync_status="created",
             )
             queue = TaskQueue(state_store=state_store, task_type="source_issue_create", owner="test")
@@ -3406,7 +3428,7 @@ class MainTests(unittest.TestCase):
             todo_path = repo / "TODO.md"
             todo_path.write_text(
                 "- [ ] 简化readme，当前的readme内容太多了\n"
-                "  issue: [#883](https://github.com/octo-org/example-repo/issues/883)\n",
+                "  issue: [#883](https://github.com/ZhuLinsen/daily_stock_analysis/issues/883)\n",
                 encoding="utf-8",
             )
             backlog = BacklogSource(
@@ -3485,7 +3507,7 @@ class MainTests(unittest.TestCase):
             todo_path = repo / "TODO.md"
             todo_path.write_text(
                 "- [ ] 简化readme，当前的readme内容太多了\n"
-                "  issue: [#883](https://github.com/octo-org/example-repo/issues/883)\n",
+                "  issue: [#883](https://github.com/ZhuLinsen/daily_stock_analysis/issues/883)\n",
                 encoding="utf-8",
             )
             backlog = BacklogSource(
@@ -3505,7 +3527,7 @@ class MainTests(unittest.TestCase):
                 title=item.title,
                 issue_title=item.title,
                 issue_number=883,
-                issue_url="https://github.com/octo-org/example-repo/issues/883",
+                issue_url="https://github.com/ZhuLinsen/daily_stock_analysis/issues/883",
                 sync_status="created",
             )
             queue = TaskQueue(state_store=state_store, task_type="source_issue_create", owner="test")
@@ -3617,10 +3639,10 @@ class MainTests(unittest.TestCase):
                         "number": 876,
                         "title": "[Bug] 修复单股推送模式下共享通知服务的并发调用问题",
                         "state": "open",
-                        "html_url": "https://github.com/octo-org/example-repo/issues/876",
+                        "html_url": "https://github.com/ZhuLinsen/daily_stock_analysis/issues/876",
                         "updated_at": "2026-03-27T10:00:00Z",
                         "created_at": "2026-03-27T10:00:00Z",
-                        "user": {"login": "maintainer", "type": "User"},
+                        "user": {"login": "ZhuLinsen", "type": "User"},
                         "labels": [{"name": "autocode"}, {"name": "bug"}],
                     }
                 ]
@@ -3718,7 +3740,7 @@ class MainTests(unittest.TestCase):
                         "html_url": f"https://example.com/issues/{800 + idx}",
                         "updated_at": "2026-03-27T10:00:00Z",
                         "created_at": "2026-03-27T10:00:00Z",
-                        "user": {"login": "maintainer", "type": "User"},
+                        "user": {"login": "ZhuLinsen", "type": "User"},
                         "labels": [{"name": "autocode"}, {"name": "bug"}],
                     }
                     for idx in range(20)
@@ -3814,7 +3836,7 @@ class MainTests(unittest.TestCase):
                         "html_url": f"https://example.com/issues/{800 + idx}",
                         "updated_at": "2026-03-27T10:00:00Z",
                         "created_at": "2026-03-27T10:00:00Z",
-                        "user": {"login": "maintainer", "type": "User"},
+                        "user": {"login": "ZhuLinsen", "type": "User"},
                         "labels": [{"name": "autocode"}, {"name": "bug"}],
                     }
                     for idx in range(20)
